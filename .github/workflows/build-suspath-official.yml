@@ -153,11 +153,11 @@ jobs:
           [ -f "$IMG" ] || { echo "断言失败：zip 里没有 kernels/Image（打包结构与官方不一致）"; exit 1; }
           echo "Image size = $(stat -c %s "$IMG") bytes   (官方 20260715 = 51052240)"
           for s in SUS_PATH_HLIST add_sus_path v1.5.7; do
-            c=$(grep -ao "$s" "$IMG" | wc -l)
+            c=$(grep -ao "$s" "$IMG" | wc -l || true)
             echo "  $s = $c"
           done
-          echo "banner: $(grep -aoE 'Linux version .{0,150}' "$IMG" | head -1)"
-          cnt=$(grep -ao 'SUS_PATH_HLIST' "$IMG" | wc -l)
+          echo "banner: $(grep -aoE 'Linux version .{0,150}' "$IMG" | head -1 || true)"
+          cnt=$(grep -ao 'SUS_PATH_HLIST' "$IMG" | wc -l || true)
           if [ "$SUS_PATH" = "on" ]; then
             [ "$cnt" -gt 0 ] || { echo "断言失败：SUS_PATH 没有编进去"; exit 1; }
             echo "✅ SUS_PATH 已编入"
@@ -204,7 +204,7 @@ jobs:
           OUT="${SRC%.zip}_${LABEL}.zip"
           cp "$SRC" "$OUT"
           TAG="suspath-${SUS_PATH}-r${{ github.run_number }}"
-          gh release create "$TAG" "$OUT" \
+          gh release create --repo "${{ github.repository }}" "$TAG" "$OUT" \
             --title "$TAG" \
             --notes "官方 build.sh 配方 @ ${COMMIT}；唯一改动 KSU_SUSFS_SUS_PATH=${SUS_PATH}。Image=$(stat -c %s /tmp/verify/Image.keep) bytes"
           echo "✅ released: $TAG -> $OUT"
