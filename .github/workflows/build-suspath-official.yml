@@ -1,0 +1,210 @@
+name: Build Kernel SUSFS-SUS_PATH (official recipe)
+
+# 目的：用 liyafe1997 官方 build.sh 的**完整配方**编译，唯一改动是把
+#   -d KSU_SUSFS_SUS_PATH  →  -e KSU_SUSFS_SUS_PATH
+# 为什么不用另一个 workflow：旧 workflow 用的是 clang 20(r547379) + 141 个 config 开关
+#   + 未锁版本的 KPM 补丁 + 根目录 Image 打包，和官方能开机那颗内核差异过大，导致刷入后
+#   开机 logo 反复亮灭（bootloop）。
+# 本 workflow 同时并行编两颗：SUS_PATH=on（要用的）与 SUS_PATH=off（对照，等价于官方那颗）。
+#   若 on 不开机而 off 能开机 → 问题在 SUS_PATH 本身；若 off 也不开机 → 是我的配方复刻有问题。
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_device:
+        description: '目标设备（defconfig 名）'
+        required: true
+        default: 'lmi'
+        type: choice
+        options:
+          - 'lmi'
+      kernel_source_commit:
+        description: '内核源码 commit（官方 20260715 = 262e587588a28c250c8bb4cc11256840d3c67d8c）'
+        required: true
+        default: '262e587588a28c250c8bb4cc11256840d3c67d8c'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (SUS_PATH=${{ matrix.sus_path }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        sus_path: ['on', 'off']
+    env:
+      DEVICE: ${{ github.event.inputs.target_device }}
+      COMMIT: ${{ github.event.inputs.kernel_source_commit }}
+      SUS_PATH: ${{ matrix.sus_path }}
+      KERNEL_SOURCE: ${{ github.workspace }}/kernel_source
+      CLANG_DIR: ${{ github.workspace }}/clang-r487747c
+
+    steps:
+      - name: 📢 Build information
+        run: |
+          echo "device      : $DEVICE"
+          echo "commit      : $COMMIT"
+          echo "SUS_PATH    : $SUS_PATH"
+          echo "runner      : $(cat /etc/os-release | grep PRETTY_NAME)"
+          echo "cpu/mem     : $(nproc) cores / $(free -g | awk '/^Mem:/{print $2}') GB / swap $(free -g | awk '/^Swap:/{print $2}') GB"
+
+      - name: 🚀 Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: 📦 Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache cpio curl flex git \
+            libelf-dev libssl-dev libncurses-dev make python3 python3-pip rsync unzip \
+            wget xz-utils zip zlib1g-dev
+          # build.sh 需要 aarch64-linux-gnu-ld 与 arm-linux-gnueabi-ld（GCC 交叉 binutils）
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            || sudo apt-get install -y binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+          missing=0
+          for t in aarch64-linux-gnu-ld arm-linux-gnueabi-ld aarch64-linux-gnu-gcc arm-linux-gnueabi-gcc; do
+            if command -v "$t" >/dev/null; then echo "OK   $t"; else echo "MISS $t"; missing=1; fi
+          done
+          [ "$missing" = "0" ] || { echo "cross toolchain incomplete"; exit 1; }
+
+      - name: 🧰 Download clang 17 (r487747c) — 官方同款工具链
+        run: |
+          set -euxo pipefail
+          mkdir -p "$CLANG_DIR"
+          cd "$CLANG_DIR"
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-14.0.0_r1/clang-r487747c.tar.gz" -O clang.tar.gz
+          tar -xzf clang.tar.gz
+          rm -f clang.tar.gz
+          # build.sh 里 TOOLCHAIN_PATH 硬编码为 $HOME/proton-clang/proton-clang-20210522，
+          # 这里用软链接指过去，保证不动 build.sh 一行。
+          mkdir -p "$HOME/proton-clang"
+          rm -rf "$HOME/proton-clang/proton-clang-20210522"
+          ln -s "$CLANG_DIR" "$HOME/proton-clang/proton-clang-20210522"
+          clang_bin="$HOME/proton-clang/proton-clang-20210522/bin/clang"
+          "$clang_bin" --version | tee /tmp/clang-version.txt
+          grep -q "17\.0\.2" /tmp/clang-version.txt || { echo "clang 版本不是 17.0.2，停止"; exit 1; }
+          echo "✅ toolchain = $(grep -o 'clang version [0-9.]*' /tmp/clang-version.txt | head -1)"
+
+      - name: 📥 Clone kernel source (pin 到官方 commit)
+        run: |
+          set -euxo pipefail
+          git init "$KERNEL_SOURCE"
+          cd "$KERNEL_SOURCE"
+          git remote add origin https://github.com/liyafe1997/kernel_xiaomi_sm8250_mod
+          if git fetch --depth=1 origin "$COMMIT"; then
+            echo "fetched pinned commit"
+          else
+            echo "!! 按 sha fetch 失败，回退到分支尖端（结果可能与官方内核有偏差）"
+            git fetch --depth=1 origin android15-lineage22-mod
+          fi
+          git checkout FETCH_HEAD
+          echo "HEAD = $(git rev-parse HEAD)"
+          echo "short = $(git rev-parse --short=8 HEAD)"
+          ls arch/arm64/configs/${DEVICE}_defconfig
+
+      - name: 🔧 Patch build.sh — 只翻转 SUS_PATH（带断言）
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SOURCE"
+          echo "--- 改动前 ---"
+          grep -n 'KSU_SUSFS_SUS_PATH' build.sh || true
+          if [ "$SUS_PATH" = "on" ]; then
+            n=$(grep -c -- '-d KSU_SUSFS_SUS_PATH' build.sh || true)
+            echo "found '-d KSU_SUSFS_SUS_PATH' x $n"
+            [ "$n" = "2" ] || { echo "断言失败：期望 2 处 -d KSU_SUSFS_SUS_PATH，实际 $n"; exit 1; }
+            sed -i 's/-d KSU_SUSFS_SUS_PATH/-e KSU_SUSFS_SUS_PATH/g' build.sh
+            d=$(grep -c -- '-d KSU_SUSFS_SUS_PATH' build.sh || true)
+            e=$(grep -c -- '-e KSU_SUSFS_SUS_PATH' build.sh || true)
+            [ "$d" = "0" ] || { echo "断言失败：仍有 -d"; exit 1; }
+            [ "$e" = "2" ] || { echo "断言失败：-e 应为 2 处，实际 $e"; exit 1; }
+          fi
+          echo "--- 改动后 ---"
+          grep -n 'KSU_SUSFS_SUS_PATH' build.sh
+          echo "--- 其余 KSU 开关（应与官方一致）---"
+          grep -n -- '-[ed] KSU_' build.sh | head -40
+
+      - name: 🔨 Build (bash build.sh <device> ksu)
+        run: |
+          set -o pipefail
+          cd "$KERNEL_SOURCE"
+          bash build.sh "$DEVICE" ksu 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: 🔎 Verify output (Image / SUS_PATH 字符串 / 编译器 banner)
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SOURCE"
+          ZIP=$(ls -1 Kernel_MIUI_${DEVICE}_*_anykernel3_*.zip | tail -1)
+          echo "ZIP = $ZIP"
+          rm -rf /tmp/verify && mkdir -p /tmp/verify
+          unzip -o -q "$ZIP" -d /tmp/verify
+          ls -l /tmp/verify /tmp/verify/kernels 2>/dev/null || true
+          IMG=/tmp/verify/kernels/Image
+          [ -f "$IMG" ] || { echo "断言失败：zip 里没有 kernels/Image（打包结构与官方不一致）"; exit 1; }
+          echo "Image size = $(stat -c %s "$IMG") bytes   (官方 20260715 = 51052240)"
+          for s in SUS_PATH_HLIST add_sus_path v1.5.7; do
+            c=$(grep -ao "$s" "$IMG" | wc -l)
+            echo "  $s = $c"
+          done
+          echo "banner: $(grep -aoE 'Linux version .{0,150}' "$IMG" | head -1)"
+          cnt=$(grep -ao 'SUS_PATH_HLIST' "$IMG" | wc -l)
+          if [ "$SUS_PATH" = "on" ]; then
+            [ "$cnt" -gt 0 ] || { echo "断言失败：SUS_PATH 没有编进去"; exit 1; }
+            echo "✅ SUS_PATH 已编入"
+          else
+            [ "$cnt" -eq 0 ] || { echo "断言失败：对照内核里竟然有 SUS_PATH"; exit 1; }
+            echo "✅ 对照组确认没有 SUS_PATH"
+          fi
+          cp "$IMG" /tmp/verify/Image.keep
+          echo "$ZIP" > /tmp/zipname.txt
+
+      - name: 🩺 Diagnostics (only on failure)
+        if: failure()
+        run: |
+          echo "=== build.log 末尾 120 行 ==="
+          tail -120 "$GITHUB_WORKSPACE/build.log" 2>/dev/null || echo "(没有 build.log)"
+          echo "=== 真正的 error 行 ==="
+          grep -nE "error:|Error [0-9]+|No such file|unrecognized|Assertion" "$GITHUB_WORKSPACE/build.log" 2>/dev/null | tail -60 || echo "(没有匹配到 error)"
+
+      - name: 📤 Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-${{ env.DEVICE }}-SUSPATH-${{ env.SUS_PATH }}
+          path: ${{ env.KERNEL_SOURCE }}/Kernel_MIUI_*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 📤 Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-SUSPATH-${{ env.SUS_PATH }}-r${{ github.run_number }}
+          path: ${{ github.workspace }}/build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 📦 Publish release (方便直接下载刷机)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SOURCE"
+          SRC=$(cat /tmp/zipname.txt)
+          if [ "$SUS_PATH" = "on" ]; then LABEL="SUSPATH-ON"; else LABEL="SUSPATH-OFF"; fi
+          OUT="${SRC%.zip}_${LABEL}.zip"
+          cp "$SRC" "$OUT"
+          TAG="suspath-${SUS_PATH}-r${{ github.run_number }}"
+          gh release create "$TAG" "$OUT" \
+            --title "$TAG" \
+            --notes "官方 build.sh 配方 @ ${COMMIT}；唯一改动 KSU_SUSFS_SUS_PATH=${SUS_PATH}。Image=$(stat -c %s /tmp/verify/Image.keep) bytes"
+          echo "✅ released: $TAG -> $OUT"
